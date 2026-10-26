@@ -441,7 +441,7 @@ class Failure(Exception):
 
 
 class GlobalState:
-    def __init__(self, min_instr_count, skip_instr_count, use_jtbl_for_rodata, prelude_if_late_rodata, mips1, pascal):
+    def __init__(self, min_instr_count, skip_instr_count, use_jtbl_for_rodata, prelude_if_late_rodata, mips1, language):
         # A value that hopefully never appears as a 32-bit rodata constant (or we
         # miscompile late rodata). Increases by 1 in each step.
         self.late_rodata_hex = 0xE0123456
@@ -452,7 +452,7 @@ class GlobalState:
         self.use_jtbl_for_rodata = use_jtbl_for_rodata
         self.prelude_if_late_rodata = prelude_if_late_rodata
         self.mips1 = mips1
-        self.pascal = pascal
+        self.language = language
 
     def next_late_rodata_hex(self):
         dummy_bytes = struct.pack('>I', self.late_rodata_hex)
@@ -467,7 +467,7 @@ class GlobalState:
         return '_asmpp_{}{}'.format(cat, self.namectr)
 
     def func_prologue(self, name):
-        if self.pascal:
+        if self.language == 'pascal':
             return " ".join([
                 "procedure {}();".format(name),
                 "type",
@@ -483,11 +483,13 @@ class GlobalState:
                 " vf := vf;",
                 " vd := vd;",
             ])
+        elif self.language == 'cpp':
+            return 'extern "C" void {}(void) {{'.format(name)
         else:
             return 'void {}(void) {{'.format(name)
 
     def func_epilogue(self):
-        if self.pascal:
+        if self.language == 'pascal':
             return "end;"
         else:
             return "}"
@@ -736,12 +738,13 @@ class GlobalAsmBlock:
             skip_next = False
             needs_double = (late_rodata_alignment != 0)
             extra_mips1_nop = False
-            if state.pascal:
+            if state.language == 'pascal':
                 jtbl_size = 9 if state.mips1 else 8
                 jtbl_min_rodata_size = 2
             else:
                 jtbl_size = 11 if state.mips1 else 9
                 jtbl_min_rodata_size = 5
+            late_rodata_fn_output.append("volatile float *vf = 0; volatile double *vd = 0;")
             for i in range(size):
                 if skip_next:
                     skip_next = False
@@ -760,7 +763,7 @@ class GlobalAsmBlock:
                 if (not needs_double and state.use_jtbl_for_rodata and i >= 1 and
                         size - i >= jtbl_min_rodata_size and
                         num_instr - len(late_rodata_fn_output) >= jtbl_size + 1):
-                    if state.pascal:
+                    if state.language == 'pascal':
                         cases = "\n".join("{}: ;".format(case) for case in range(size - i))
                         line = "case 0 of " + cases + " otherwise end;"
                     else:
@@ -777,10 +780,10 @@ class GlobalAsmBlock:
                     dummy_bytes2 = state.next_late_rodata_hex()
                     late_rodata_dummy_bytes.append(dummy_bytes2)
                     fval, = struct.unpack('>d', dummy_bytes + dummy_bytes2)
-                    if state.pascal:
+                    if state.language == 'pascal':
                         line = state.pascal_assignment('d', fval)
                     else:
-                        line = '*(volatile double*)0 = {};'.format(fval)
+                        line = '*vd = {};'.format(fval)
                     late_rodata_fn_output.append(line)
                     skip_next = True
                     needs_double = False
@@ -791,10 +794,10 @@ class GlobalAsmBlock:
                     extra_mips1_nop = False
                 else:
                     fval, = struct.unpack('>f', dummy_bytes)
-                    if state.pascal:
+                    if state.language == 'pascal':
                         line = state.pascal_assignment('f', fval)
                     else:
-                        line = '*(volatile float*)0 = {}f;'.format(fval)
+                        line = '*vf = {}f;'.format(fval)
                     late_rodata_fn_output.append(line)
                     extra_mips1_nop = True
                 late_rodata_fn_output.append('')
@@ -816,6 +819,7 @@ class GlobalAsmBlock:
             fn_skipped = 0
             skipping = True
             rodata_stack = late_rodata_fn_output[::-1]
+            count_em_up = 0
             for (line, count) in self.fn_ins_inds:
                 for _ in range(count):
                     if (fn_emitted > MAX_FN_SIZE and instr_count - tot_emitted > state.min_instr_count and
@@ -841,10 +845,11 @@ class GlobalAsmBlock:
                         skipping = False
                         if rodata_stack:
                             src[line] += rodata_stack.pop()
-                        elif state.pascal:
+                        elif state.language == 'pascal':
                             src[line] += state.pascal_assignment('i', '0')
                         else:
-                            src[line] += '*(volatile int*)0 = 0;'
+                            src[line] += f'*(volatile int*)0x{count_em_up:x} = 0;'
+                            count_em_up += 4
                     tot_emitted += 1
                     fn_emitted += 1
             if rodata_stack:
@@ -858,15 +863,17 @@ class GlobalAsmBlock:
 
         rodata_name = None
         if self.fn_section_sizes['.rodata'].size > 0:
-            if state.pascal:
+            if state.language == 'pascal':
                 self.fail(".rodata isn't supported with Pascal for now")
+            if state.language == 'cpp':
+                src[self.num_lines] += ' extern "C"'
             rodata_name = state.make_name('rodata')
             src[self.num_lines] += ' const char {}[{}] = {{1}};'.format(rodata_name, self.fn_section_sizes['.rodata'].size)
 
         data_name = None
         if self.fn_section_sizes['.data'].size > 0:
             data_name = state.make_name('data')
-            if state.pascal:
+            if state.language == 'pascal':
                 line = ' var {}: packed array[1..{}] of char := [otherwise: 0];'.format(data_name, self.fn_section_sizes['.data'].size)
             else:
                 line = ' char {}[{}] = {{1}};'.format(data_name, self.fn_section_sizes['.data'].size)
@@ -874,7 +881,7 @@ class GlobalAsmBlock:
 
         bss_name = None
         if self.fn_section_sizes['.bss'].size > 0:
-            if state.pascal:
+            if state.language == 'pascal':
                 self.fail(".bss isn't supported with Pascal")
             bss_name = state.make_name('bss')
             src[self.num_lines] += ' char {}[{}];'.format(bss_name, self.fn_section_sizes['.bss'].size)
@@ -900,7 +907,7 @@ float_regexpr = re.compile(r"[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?f")
 def repl_float_hex(m):
     return str(struct.unpack(">I", struct.pack(">f", float(m.group(0).strip().rstrip("f"))))[0])
 
-Opts = namedtuple('Opts', ['opt', 'framepointer', 'mips1', 'kpic', 'pascal', 'input_enc', 'output_enc', 'base_dir', 'encode_cutscene_data_floats', 'force_file_directive'])
+Opts = namedtuple('Opts', ['opt', 'framepointer', 'mips1', 'kpic', 'language', 'input_enc', 'output_enc', 'base_dir', 'encode_cutscene_data_floats', 'force_file_directive'])
 
 def parse_source(f, opts, out_dependencies, print_source=None):
     if opts.opt in ['O1', 'O2']:
@@ -947,7 +954,7 @@ def parse_source(f, opts, out_dependencies, print_source=None):
     if opts.opt in ['O2', 'g3'] and not opts.framepointer and not opts.kpic:
         use_jtbl_for_rodata = True
 
-    state = GlobalState(min_instr_count, skip_instr_count, use_jtbl_for_rodata, prelude_if_late_rodata, opts.mips1, opts.pascal)
+    state = GlobalState(min_instr_count, skip_instr_count, use_jtbl_for_rodata, prelude_if_late_rodata, opts.mips1, opts.language)
     output_enc = opts.output_enc
 
     global_asm = None
@@ -975,7 +982,7 @@ def parse_source(f, opts, out_dependencies, print_source=None):
         if global_asm is not None:
             if line.startswith(')'):
                 src, fn = global_asm.finish(state)
-                if state.pascal:
+                if state.language == 'pascal':
                     # Pascal has a 1600-character line length limit, so some
                     # of the lines we emit may be broken up. Correct for that
                     # using a #line directive.
@@ -1024,7 +1031,7 @@ def parse_source(f, opts, out_dependencies, print_source=None):
                 for line2 in f:
                     ext_global_asm.process_line(line2.rstrip(), output_enc)
             src, fn = ext_global_asm.finish(state)
-            if state.pascal:
+            if state.language == 'pascal':
                 # Pascal has a 1600-character line length limit, so avoid putting
                 # everything on the same line.
                 src.append('#line ' + str(line_no + 1))
@@ -1414,7 +1421,7 @@ def fixup_objfile(objfile_name, functions, asm_prelude, assembler, output_enc, d
         for s in new_syms:
             if s.name == "_gp_disp":
                 s.st_type = STT_OBJECT
-            if s.st_bind == STB_LOCAL and s.st_shndx == SHN_UNDEF:
+            if s.st_bind == STB_LOCAL and s.st_shndx == SHN_UNDEF and "__edg_version_sym" not in s.name:
                 raise Failure("local symbol \"" + s.name + "\" is undefined")
             if not s.name:
                 if s.st_bind != STB_LOCAL:
@@ -1526,17 +1533,22 @@ def run_wrapped(argv, outfile, functions):
     group.add_argument('-g', dest='opt', action='store_const', const='g')
     args = parser.parse_args(argv)
     opt = args.opt
-    pascal = any(args.filename.endswith(ext) for ext in (".p", ".pas", ".pp"))
+    if any(args.filename.endswith(ext) for ext in (".p", ".pas", ".pp")):
+        language = 'pascal'
+    elif any(args.filename.endswith(ext) for ext in (".cpp", ".cc")):
+        language = 'cpp'
+    else:
+        language = 'c'
     if args.g3:
         if opt != 'O2':
             raise Failure("-g3 is only supported together with -O2")
         opt = 'g3'
     if args.mips1 and (opt not in ('O1', 'O2') or args.framepointer):
         raise Failure("-mips1 is only supported together with -O1 or -O2")
-    if pascal and opt not in ('O1', 'O2', 'g3'):
+    if language == 'pascal' and opt not in ('O1', 'O2', 'g3'):
         raise Failure("Pascal is only supported together with -O1, -O2 or -O2 -g3")
     output_enc = Encoding(args.output_enc)
-    opts = Opts(opt, args.framepointer, args.mips1, args.kpic, pascal, args.input_enc, output_enc, args.base_dir, args.encode_cutscene_data_floats, args.force_file_directive)
+    opts = Opts(opt, args.framepointer, args.mips1, args.kpic, language, args.input_enc, output_enc, args.base_dir, args.encode_cutscene_data_floats, args.force_file_directive)
 
     if args.objfile is None:
         with open(args.filename, encoding=args.input_enc) as f:
