@@ -865,9 +865,9 @@ class GlobalAsmBlock:
         if self.fn_section_sizes['.rodata'].size > 0:
             if state.language == 'pascal':
                 self.fail(".rodata isn't supported with Pascal for now")
+            rodata_name = state.make_name('rodata')
             if state.language == 'cpp':
                 src[self.num_lines] += ' extern "C"'
-            rodata_name = state.make_name('rodata')
             src[self.num_lines] += ' const char {}[{}] = {{1}};'.format(rodata_name, self.fn_section_sizes['.rodata'].size)
 
         data_name = None
@@ -884,6 +884,8 @@ class GlobalAsmBlock:
             if state.language == 'pascal':
                 self.fail(".bss isn't supported with Pascal")
             bss_name = state.make_name('bss')
+            if state.language == 'cpp':
+                src[self.num_lines] += ' extern "C"'
             src[self.num_lines] += ' char {}[{}];'.format(bss_name, self.fn_section_sizes['.bss'].size)
 
         fn = Function(
